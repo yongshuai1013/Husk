@@ -3,14 +3,11 @@
 #
 # No signing team is needed: AltStore / SideStore re-sign at install with the
 # user's own profile. The IPA is signed ad hoc with Husk.entitlements embedded
-# anyway.
-#
-# When packaging for TrollStore, use the `--trollstore` option (or specify a
-# `.tipa` output). This strips entitlements such as dynamic-codesigning, which
-# cause launch validation failures on devices where PPL/TXM is not disabled.
-# For standard sideloaders, the app is re-signed against a new Apple development
-# provisioning profile, so unsupported entitlements such as dynamic-codesigning
-# are normally not preserved in the final signature.
+# anyway, because TrollStore keeps the entitlements a binary already carries
+# (RootHelper's signApp reads them from the binary) and invents only
+# get-task-allow for one that has none. Signed this way, the same file gets the
+# memory and dynamic-codesigning entitlements under TrollStore, and a sideloader
+# simply replaces the signature.
 #
 # The validation step exists because a bundle missing CFBundleIdentifier or
 # CFBundleExecutable builds and zips perfectly happily, and then fails to install
@@ -74,25 +71,19 @@ xcodebuild -project "$HUSK_ROOT/src/app/Husk.xcodeproj" -scheme Husk \
 if ! grep -q "BUILD SUCCEEDED" "$DD/build.log"; then
     echo "build failed; refusing to package a stale app" >&2
     grep -E "error:" "$DD/build.log" | head -10 >&2
+    grep -A 40 "Undefined symbols" "$DD/build.log" >&2 || true
     exit 1
 fi
 
 APP="$DD/Build/Products/Release-iphoneos/Husk.app"
-
-# The Java runtime in the app must be the one just built (build_java_runtime.sh): copied again here, and checked, so an IPA can
-# never carry an older one -- which looks exactly like Java fixes that did not work.
-JRT="$HUSK_ROOT/build/java-runtime"
-if [ -f "$JRT/husk-framework.dex" ]; then
-    rsync -a --delete "$JRT/" "$APP/java-runtime/"
-    if ! cmp -s "$JRT/husk-framework.dex" "$APP/java-runtime/husk-framework.dex"; then
-        echo "the app's Java framework is not build/java-runtime's; refusing to package" >&2
-        exit 1
-    fi
-    echo "==> java runtime: $(stat -f '%z bytes, %Sm' "$JRT/husk-framework.dex")"
-fi
 [ -d "$APP" ] || { echo "no app bundle at $APP" >&2; exit 1; }
-# Do not copy build/aot/*.dylib into the IPA. Those are converted Android game
-# libraries from local testing; shipping them is distributing the game.
+
+# HuskDownloadsWidget 需要 ActivityKit（iOS 16.1+），在 iOS 15 上啟動即閃退。
+# 舊工程會把它編進 PlugIns，這裡在打包前直接刪掉，主 App 不受影響。
+if [ -d "$APP/PlugIns/HuskDownloadsWidget.appex" ]; then
+    echo "==> removing iOS 16-only DownloadsWidget (crashes on iOS 15)"
+    rm -rf "$APP/PlugIns/HuskDownloadsWidget.appex"
+fi
 
 # Stamp the build's identity into the bundle so its logs can name themselves.
 # A log from a stale install is otherwise indistinguishable from a log proving a
@@ -137,7 +128,7 @@ fi
 # @rpath/libANGLE-shared.dylib". Everything else in this validation passed. A
 # check that covers one of two required libraries is a check that reports
 # success on a bundle that cannot launch.
-for lib in libqemu-aarch64-softmmu.dylib libANGLE-shared.dylib libhuskps4.dylib; do
+for lib in libqemu-aarch64-softmmu.dylib libANGLE-shared.dylib; do
     if [ ! -f "$APP/Frameworks/$lib" ]; then
         echo "  MISSING  Frameworks/$lib" >&2
         rc=1
@@ -159,10 +150,9 @@ for f in vmlinuz-virt initramfs-virt husk-jit.js \
 done
 
 # Built-in StikJIT's helper (without it the app still installs and runs with
-# StikDebug, but its JIT setup would offer a method that can only fail), and the
-# widget that draws the download Live Activity.
+# StikDebug, but its JIT setup would offer a method that can only fail).
+# (HuskDownloadsWidget 已在上方刪除：它要 ActivityKit，iOS 15 必閃退。)
 for f in "$APP/PlugIns/HuskJITHelper.appex/HuskJITHelper" \
-         "$APP/PlugIns/HuskDownloadsWidget.appex/HuskDownloadsWidget" \
          "$APP/Frameworks/StikJIT.framework/StikJIT" \
          "$APP/Frameworks/StikJIT.framework/Info.plist"; do
     if [ ! -f "$f" ]; then
@@ -175,10 +165,41 @@ done
 
 [ $rc -eq 0 ] || { echo "==> bundle is not installable; refusing to package" >&2; exit 1; }
 
+# Bundle the Java runtime directly into the app so the device never needs to
+# download or decompress it (both paths kept failing on-device). The app
+# prefers Documents/java-runtime when present, else falls back to this copy.
+# Must run before the ad-hoc codesign below so the files are sealed.
+RUNTIME_ZLIB="$HUSK_ROOT/assets/java-runtime.tar.zlib"
+if [ -f "$RUNTIME_ZLIB" ]; then
+    echo "==> extracting java-runtime into app bundle"
+    python3 - "$RUNTIME_ZLIB" "$APP" <<'PYEOF_INNER'
+import sys, zlib, tarfile, io, os
+zlib_path, app_dir = sys.argv[1], sys.argv[2]
+with open(zlib_path, 'rb') as f:
+    tar_data = zlib.decompress(f.read())
+with tarfile.open(fileobj=io.BytesIO(tar_data)) as t:
+    for m in t.getmembers():
+        if m.name.startswith('/') or '..' in m.name.split('/'):
+            raise SystemExit(f"unsafe tar member: {m.name}")
+    t.extractall(app_dir)
+    count = len(t.getmembers())
+jar = os.path.join(app_dir, "java-runtime/com.android.art/javalib/core-oj.jar")
+assert os.path.isfile(jar), "core-oj.jar missing after extract"
+print(f"==> java-runtime bundled ({count} files)")
+PYEOF_INNER
+else
+    echo "==> WARNING: $RUNTIME_ZLIB not found; java-runtime will not be bundled" >&2
+fi
+# The AOSP core dex rides as its own asset: inside the runtime tar it would push
+# the file past the GitHub API blob size limit. Same folder, so aosp.c finds it.
+CORE_DEX="$HUSK_ROOT/assets/husk-framework-core.dex"
+if [ -f "$CORE_DEX" ] && [ -d "$APP/java-runtime" ]; then
+    cp "$CORE_DEX" "$APP/java-runtime/husk-framework-core.dex"
+    echo "==> bundled husk-framework-core.dex"
+fi
+
 echo "==> packaging"
-# staged next to the build (DD), not in the system temp folder: a full startup disk made codesign fail with "internal error"
-STAGE="$(mktemp -d "$DD/stage.XXXXXX")"
-trap 'rm -rf "$STAGE"' EXIT
+STAGE="$(mktemp -d)"
 mkdir -p "$STAGE/Payload"
 cp -R "$APP" "$STAGE/Payload/"
 
@@ -187,8 +208,6 @@ cp -R "$APP" "$STAGE/Payload/"
 ENT_BASE="$HUSK_ROOT/src/app/Husk/Husk.entitlements"
 ENT="$STAGE/entitlements.plist"
 cp "$ENT_BASE" "$ENT"
-# Entitlements that cause launch crashes on TrollStore under PPL/TXM
-# (see https://github.com/opa334/TrollStore#banned-entitlements).
 BANNED_KEYS=(
     "com.apple.private.cs.debugger"
     "dynamic-codesigning"
