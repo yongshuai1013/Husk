@@ -118,7 +118,6 @@ public class Activity extends ContextThemeWrapper implements Window.Callback, Ke
             if (mLoaders != null) mLoaders.doStop();
             each(c -> c.onActivityPostStopped(this));
         }
-        if (mWindow != null && mWindow.peekDecorView() != null) { husk.ViewRoot r = husk.ViewRoot.of(mWindow.peekDecorView()); if (r != null) r.remove(); }
     }
     public final void huskDestroy() {
         each(c -> c.onActivityPreDestroyed(this));
@@ -126,6 +125,12 @@ public class Activity extends ContextThemeWrapper implements Window.Callback, Ke
         mDestroyed = true; onDestroy();
         if (mLoaders != null) mLoaders.doDestroy();
         each(c -> c.onActivityPostDestroyed(this));
+        /* the window goes away only here, not in huskStop: on Android a stopped (covered) activity keeps its
+           window and its view tree attached, so animations it posted survive being covered. Removing the root
+           in huskStop detached the tree and cancelled every pending ViewPropertyAnimator -- an activity that
+           fades its content in from onPostCreate and is instantly covered by a sibling launch (TaskStackBuilder
+           parents) lost its fade-in and came back invisible. */
+        if (mWindow != null && mWindow.peekDecorView() != null) { husk.ViewRoot r = husk.ViewRoot.of(mWindow.peekDecorView()); if (r != null) r.remove(); }
         if (mWindow != null) mWindow.huskDestroy();
     }
     public final void huskBack() { onBackPressedHusk(); }
