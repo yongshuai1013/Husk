@@ -13,13 +13,12 @@ struct ProfileView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if let user = account.user, account.signedIn { profile(user) } else { SignInView() }
-            }
-            .background(Console.page.ignoresSafeArea())
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                if account.signedIn {
+            // iOS 15 build fix: ToolbarContentBuilder has no buildIf before
+            // iOS 16, so the signed-in item cannot be conditional inside
+            // .toolbar; branch outside it instead. Same items, same behaviour.
+            if account.signedIn {
+                page.toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
                     ToolbarItem(placement: .primaryAction) {
                         Menu {
                             Button { editing = true } label: { Label("Edit Profile", systemImage: "pencil") }
@@ -34,10 +33,21 @@ struct ProfileView: View {
                         } label: { Image(systemName: "ellipsis.circle") }
                     }
                 }
+            } else {
+                page.toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                }
             }
-            .sheet(isPresented: $editing) { EditProfileView() }
-            .task { await account.refresh(); await account.syncLibrary() }
         }
+    }
+
+    private var page: some View {
+        Group {
+            if let user = account.user, account.signedIn { profile(user) } else { SignInView() }
+        }
+        .background(Console.page.ignoresSafeArea())
+        .sheet(isPresented: $editing) { EditProfileView() }
+        .task { await account.refresh(); await account.syncLibrary() }
     }
 
     private func profile(_ u: HuskUser) -> some View {
